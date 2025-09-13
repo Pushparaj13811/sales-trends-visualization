@@ -6,6 +6,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sqlite3
 from datetime import datetime, timedelta
+import pickle
+import joblib
+import json
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -225,10 +228,297 @@ def create_customer_segments_chart(rfm_df):
     fig.update_layout(height=400)
     return fig
 
+@st.cache_resource
+def load_prediction_models():
+    """Load trained models for churn prediction"""
+    import os
+    try:
+        # Get the directory where the app is running from
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        models_dir = os.path.join(os.path.dirname(current_dir), 'models')
+
+        lr_model = joblib.load(os.path.join(models_dir, 'logistic_regression_churn.pkl'))
+        rf_model = joblib.load(os.path.join(models_dir, 'random_forest_churn.pkl'))
+        scaler = joblib.load(os.path.join(models_dir, 'scaler.pkl'))
+
+        with open(os.path.join(models_dir, 'model_metrics.json'), 'r') as f:
+            metrics = json.load(f)
+
+        return lr_model, rf_model, scaler, metrics
+    except Exception as e:
+        st.error(f"Error loading models: {e}")
+        st.error(f"Current working directory: {os.getcwd()}")
+        st.error(f"Looking for models in: {models_dir if 'models_dir' in locals() else 'Path not set'}")
+        return None, None, None, None
+
+def prepare_prediction_features(customer_data):
+    """Prepare features for prediction using the exact same features as training"""
+
+    # Create feature DataFrame
+    features_df = pd.DataFrame([customer_data])
+
+    # Calculate derived features
+    features_df['order_frequency_rate'] = features_df['Frequency'] / max(features_df['total_orders'].iloc[0], 1)
+    features_df['avg_order_value'] = features_df['Monetary'] / max(features_df['Frequency'].iloc[0], 1)
+
+    # Calculate RFM scores if not provided
+    if 'R_Score' not in customer_data:
+        if customer_data['Recency'] <= 30:
+            features_df['R_Score'] = 5
+        elif customer_data['Recency'] <= 60:
+            features_df['R_Score'] = 4
+        elif customer_data['Recency'] <= 120:
+            features_df['R_Score'] = 3
+        elif customer_data['Recency'] <= 240:
+            features_df['R_Score'] = 2
+        else:
+            features_df['R_Score'] = 1
+
+    if 'F_Score' not in customer_data:
+        if customer_data['Frequency'] >= 10:
+            features_df['F_Score'] = 5
+        elif customer_data['Frequency'] >= 5:
+            features_df['F_Score'] = 4
+        elif customer_data['Frequency'] >= 3:
+            features_df['F_Score'] = 3
+        elif customer_data['Frequency'] >= 2:
+            features_df['F_Score'] = 2
+        else:
+            features_df['F_Score'] = 1
+
+    if 'M_Score' not in customer_data:
+        if customer_data['Monetary'] >= 1000:
+            features_df['M_Score'] = 5
+        elif customer_data['Monetary'] >= 500:
+            features_df['M_Score'] = 4
+        elif customer_data['Monetary'] >= 200:
+            features_df['M_Score'] = 3
+        elif customer_data['Monetary'] >= 100:
+            features_df['M_Score'] = 2
+        else:
+            features_df['M_Score'] = 1
+
+    # Add the exact features that were used during training
+    # These are estimates since we don't have access to detailed transaction history in the input
+    features_df['avg_sales'] = features_df['avg_order_value']  # Approximate as avg_order_value
+    features_df['std_sales'] = features_df['avg_order_value'] * 0.3  # Estimate std as 30% of avg
+    features_df['avg_profit'] = features_df['avg_order_value'] * 0.2  # Estimate 20% profit margin
+    features_df['avg_discount'] = features_df['avg_order_value'] * 0.1  # Estimate 10% discount
+    features_df['avg_margin'] = 0.2  # Estimate 20% margin
+    features_df['sales_volatility'] = features_df['std_sales'] / max(features_df['avg_sales'].iloc[0], 1)
+
+    # Use the exact feature columns from training (in the same order)
+    feature_columns = [
+        'Recency', 'Frequency', 'Monetary', 'R_Score', 'F_Score', 'M_Score',
+        'total_orders', 'avg_sales', 'std_sales', 'avg_profit', 'avg_discount',
+        'total_quantity', 'avg_margin', 'avg_order_value', 'order_frequency_rate',
+        'sales_volatility'
+    ]
+
+    return features_df[feature_columns]
+
+def predict_churn(customer_data, models):
+    """Predict churn probability for a customer"""
+    lr_model, rf_model, scaler, metrics = models
+
+    if any(model is None for model in models):
+        return None
+
+    # Prepare features
+    features = prepare_prediction_features(customer_data)
+
+    # Scale features
+    features_scaled = scaler.transform(features)
+
+    # Make predictions with both models
+    rf_prob = rf_model.predict_proba(features_scaled)[0][1]
+    lr_prob = lr_model.predict_proba(features_scaled)[0][1]
+
+    # Get binary predictions
+    rf_pred = rf_model.predict(features_scaled)[0]
+    lr_pred = lr_model.predict(features_scaled)[0]
+
+    return {
+        'random_forest': {
+            'probability': rf_prob,
+            'prediction': bool(rf_pred),
+            'accuracy': metrics['random_forest']['accuracy']
+        },
+        'logistic_regression': {
+            'probability': lr_prob,
+            'prediction': bool(lr_pred),
+            'accuracy': metrics['logistic_regression']['accuracy']
+        },
+        'consensus': {
+            'avg_probability': (rf_prob + lr_prob) / 2,
+            'both_predict_churn': bool(rf_pred) and bool(lr_pred)
+        }
+    }
+
+def get_risk_level(probability):
+    """Convert probability to risk level"""
+    if probability >= 0.7:
+        return 'High Risk', '🔴'
+    elif probability >= 0.4:
+        return 'Medium Risk', '🟡'
+    else:
+        return 'Low Risk', '🟢'
+
+def show_prediction_page():
+    """Show the churn prediction page"""
+    st.header("🔮 Customer Churn Prediction")
+
+    # Load models
+    models = load_prediction_models()
+
+    if any(model is None for model in models):
+        st.error("Could not load prediction models. Please check if model files exist.")
+        return
+
+    _, _, _, metrics = models
+
+    # Show model performance
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("🌲 Random Forest Model")
+        st.metric("Accuracy", f"{metrics['random_forest']['accuracy']:.1%}")
+        st.metric("ROC AUC", f"{metrics['random_forest']['roc_auc']:.3f}")
+
+    with col2:
+        st.subheader("📈 Logistic Regression Model")
+        st.metric("Accuracy", f"{metrics['logistic_regression']['accuracy']:.1%}")
+        st.metric("ROC AUC", f"{metrics['logistic_regression']['roc_auc']:.3f}")
+
+    st.divider()
+
+    # Input form
+    st.subheader("📝 Enter Customer Information")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**🕒 Recency & Frequency**")
+        recency = st.number_input("Days since last order", min_value=0, value=30, step=1)
+        frequency = st.number_input("Number of orders", min_value=1, value=3, step=1)
+        total_orders = st.number_input("Total orders", min_value=1, value=frequency, step=1)
+
+    with col2:
+        st.markdown("**💰 Monetary Value**")
+        monetary = st.number_input("Total amount spent ($)", min_value=0.0, value=200.0, step=10.0)
+        avg_order_value = st.number_input("Average order value ($)", min_value=0.0, value=monetary/frequency, step=5.0)
+
+    with col3:
+        st.markdown("**📦 Order Details**")
+        total_quantity = st.number_input("Total items purchased", min_value=1, value=frequency*2, step=1)
+
+    # Predict button
+    if st.button("🔮 Predict Churn Risk", type="primary"):
+
+        # Prepare customer data
+        customer_data = {
+            'Recency': recency,
+            'Frequency': frequency,
+            'Monetary': monetary,
+            'total_orders': total_orders,
+            'avg_order_value': avg_order_value,
+            'total_quantity': total_quantity
+        }
+
+        # Make prediction
+        with st.spinner("Making prediction..."):
+            results = predict_churn(customer_data, models)
+
+        if results:
+            st.divider()
+            st.subheader("📊 Prediction Results")
+
+            # Show consensus first
+            consensus = results['consensus']
+            risk_level, risk_icon = get_risk_level(consensus['avg_probability'])
+
+            st.markdown(f"""
+            <div class="insight-box">
+                <h3>{risk_icon} Overall Risk Assessment</h3>
+                <p><strong>Risk Level:</strong> {risk_level}</p>
+                <p><strong>Average Churn Probability:</strong> {consensus['avg_probability']:.1%}</p>
+                <p><strong>Model Consensus:</strong> {'Both models predict churn' if consensus['both_predict_churn'] else 'Models disagree or predict retention'}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Detailed results
+            col1, col2 = st.columns(2)
+
+            with col1:
+                rf_result = results['random_forest']
+                st.markdown("**🌲 Random Forest Prediction**")
+                st.metric("Churn Probability", f"{rf_result['probability']:.1%}")
+                st.metric("Prediction", "Will Churn" if rf_result['prediction'] else "Will Retain")
+
+            with col2:
+                lr_result = results['logistic_regression']
+                st.markdown("**📈 Logistic Regression Prediction**")
+                st.metric("Churn Probability", f"{lr_result['probability']:.1%}")
+                st.metric("Prediction", "Will Churn" if lr_result['prediction'] else "Will Retain")
+
+            # Recommendations
+            st.subheader("💡 Recommendations")
+
+            avg_prob = consensus['avg_probability']
+            if avg_prob >= 0.7:
+                st.error("""
+                **🚨 HIGH RISK - Immediate Action Required!**
+                - Offer significant discount or loyalty bonus
+                - Personal outreach from customer success team
+                - Expedited customer service support
+                - Consider win-back campaign if they haven't ordered recently
+                """)
+            elif avg_prob >= 0.4:
+                st.warning("""
+                **⚠️ MEDIUM RISK - Monitor and Engage**
+                - Send targeted retention email campaigns
+                - Offer personalized product recommendations
+                - Provide small incentives or discounts
+                - Monitor ordering patterns closely
+                """)
+            else:
+                st.success("""
+                **✅ LOW RISK - Focus on Growth**
+                - Continue regular engagement
+                - Focus on upselling and cross-selling
+                - Gather feedback for service improvement
+                - Consider loyalty program enrollment
+                """)
+
+    # Feature importance
+    st.divider()
+    st.subheader("📈 Model Feature Importance")
+
+    if 'top_features' in metrics:
+        features_df = pd.DataFrame(metrics['top_features'])
+
+        fig = px.bar(features_df,
+                     x='importance',
+                     y='feature',
+                     orientation='h',
+                     title='Top Features for Churn Prediction')
+        fig.update_layout(height=400, yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+
 def main():
     """Main dashboard function"""
     # Header
     st.markdown('<h1 class="main-header">📊 Superstore Analytics Dashboard</h1>', unsafe_allow_html=True)
+
+    # Navigation
+    page = st.sidebar.selectbox(
+        "Navigate to:",
+        ["📊 Analytics Dashboard", "🔮 Churn Prediction"]
+    )
+
+    if page == "🔮 Churn Prediction":
+        show_prediction_page()
+        return
 
     # Load data
     df, rfm_df = load_data()
