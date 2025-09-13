@@ -67,8 +67,8 @@ superstore_analysis/
 
 1. **Clone and Setup**
    ```bash
-   git clone <repository-url>
-   cd superstore_analysis
+   git clone https://github.com/Pushparaj13811/sales-trends-visualization
+   cd sales-trends-visualization
    pip install -r requirements.txt
    ```
 
