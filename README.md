@@ -88,8 +88,8 @@ superstore_analysis/
 
 1. **Build and Run Container**
    ```bash
-   docker build -t superstore-analytics .
-   docker run -p 8501:8501 superstore-analytics
+   docker build -t sales-trends-visualization .
+   docker run -p 8501:8501 sales-trends-visualization
    ```
 
 2. **Access Dashboard**
