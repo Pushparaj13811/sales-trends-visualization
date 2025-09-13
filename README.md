@@ -251,6 +251,4 @@ The project generates:
 
 ---
 
-**🤖 Generated with [Claude Code](https://claude.ai/code)**
-
 *This project demonstrates production-ready data analytics with enterprise-level insights and recommendations. Perfect for showcasing data analyst capabilities to hiring managers and stakeholders.*
